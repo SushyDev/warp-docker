@@ -2,56 +2,19 @@ name: Build and publish Docker image
 
 on:
   workflow_dispatch:
-    inputs:
-      GOST_VERSION:
-        description: "Version of gost. If empty, the latest version will be used."
-        required: false
-        type: string
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/${{ github.event.repository.name }}
 
 jobs:
-  get-versions:
-    runs-on: ubuntu-latest
-    outputs:
-      GOST_VERSION: ${{ steps.get-gost-version.outputs.GOST_VERSION }}
-      WARP_VERSION: ${{ steps.get-warp-client-version.outputs.WARP_VERSION }}
-    steps:
-      - name: Get gost version
-        id: get-gost-version
-        run: |
-          if [ -z "${{ github.event.inputs.GOST_VERSION }}" ]; then
-            echo "GOST_VERSION=$(curl -sL -H 'authorization: Bearer ${{ secrets.GITHUB_TOKEN }}' https://api.github.com/repos/ginuerzh/gost/releases/latest | jq -r '.tag_name' | sed 's/^v//')" >> "$GITHUB_OUTPUT"
-          else
-            echo "GOST_VERSION=${{ github.event.inputs.GOST_VERSION }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Verify gost version
-        run: |
-          if [[ ! "${{ steps.get-gost-version.outputs.GOST_VERSION }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid gost version: ${{ steps.get-gost-version.outputs.GOST_VERSION }}"
-            exit 1
-          fi
-
-      - name: Get WARP client version
-        id: get-warp-client-version
-        run: |
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update
-          echo "WARP_VERSION=$(apt-cache show cloudflare-warp | grep '^Version:' | awk '{print $2}' | sed 's/-[0-9]*$//')" >> "$GITHUB_OUTPUT"
-
   build:
-    needs: get-versions
     strategy:
       fail-fast: true
       matrix:
         platform:
           - linux/amd64
           - linux/arm64
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform == 'linux/amd64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     permissions:
       contents: read
       packages: write
@@ -59,8 +22,9 @@ jobs:
     steps:
       - name: Prepare
         run: |
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY@L}" >> $GITHUB_ENV
           platform="${{ matrix.platform }}"
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+          echo "PLATFORM_PAIR=${platform//\//\-}" >> $GITHUB_ENV
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -69,31 +33,6 @@ jobs:
         uses: docker/setup-qemu-action@v3
         with:
           image: tonistiigi/binfmt:qemu-v7.0.0
-
-      - name: Determine GOST download URL
-        id: get-gost-url
-        run: |
-          GOST_VERSION="${{ needs.get-versions.outputs.GOST_VERSION }}"
-          TARGET_PLATFORM="${{ matrix.platform }}"
-          
-          case ${TARGET_PLATFORM} in
-            "linux/amd64") ARCH="amd64" ;;
-            "linux/arm64") ARCH="arm64" ;;
-            *) echo "Unsupported platform: ${TARGET_PLATFORM}" && exit 1 ;;
-          esac
-          
-          MAJOR_VERSION=$(echo ${GOST_VERSION} | cut -d. -f1)
-          MINOR_VERSION=$(echo ${GOST_VERSION} | cut -d. -f2)
-          
-          if [ "${MAJOR_VERSION}" -ge 3 ] || { [ "${MAJOR_VERSION}" -eq 2 ] && [ "${MINOR_VERSION}" -ge 12 ]; }; then
-            FILE_NAME="gost_${GOST_VERSION}_linux_${ARCH}.tar.gz"
-          else
-            LEGACY_ARCH=$([ "${ARCH}" = "arm64" ] && echo "armv8" || echo "amd64")
-            FILE_NAME="gost-linux-${LEGACY_ARCH}-${GOST_VERSION}.gz"
-          fi
-          
-          GOST_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/${FILE_NAME}"
-          echo "GOST_URL=${GOST_URL}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to registry
         uses: docker/login-action@v3
@@ -107,15 +46,8 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
-          build-args: |
-            GOST_URL=${{ steps.get-gost-url.outputs.GOST_URL }}
-            GOST_VERSION=${{ needs.get-versions.outputs.GOST_VERSION }}
-            WARP_VERSION=${{ needs.get-versions.outputs.WARP_VERSION }}
-            COMMIT_SHA=${{ github.sha }}
-            TARGET_PLATFORM=${{ matrix.platform }}
-          context: .
           platforms: ${{ matrix.platform }}
           labels: org.opencontainers.image.source=${{ github.repository }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
@@ -135,13 +67,16 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: [get-versions, build]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
+      - name: Prepare
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY@L}" >> $GITHUB_ENV
+
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
@@ -161,6 +96,4 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.get-versions.outputs.WARP_VERSION }}-${{ needs.get-versions.outputs.GOST_VERSION }} \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.get-versions.outputs.WARP_VERSION }}-${{ needs.get-versions.outputs.GOST_VERSION }}-${{ github.sha }} \
             $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
